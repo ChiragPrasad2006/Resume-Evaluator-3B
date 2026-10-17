@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project cache & outputs
+data/raw_netsol/
+outputs/
