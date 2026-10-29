@@ -27,22 +27,27 @@ random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
 
+from datasets import Dataset, DatasetDict
+
 def load_datasets() -> List[Dict[str, Any]]:
     """Loads and combines curated and synthetic datasets."""
     all_records = []
     
-    if not config.CURATED_DATA_PATH.exists():
-        raise FileNotFoundError(f"Missing {config.CURATED_DATA_PATH}. Run inspect_and_curate.py first.")
-    if not config.HARD_NEGATIVES_PATH.exists():
-        raise FileNotFoundError(f"Missing {config.HARD_NEGATIVES_PATH}. Run synthesize_hard_negatives.py first.")
+    curated_path = config.BASE_CURATED_PATH if config.BASE_CURATED_PATH.exists() else config.CURATED_DATA_PATH
+    synth_path = config.SYNTHETIC_HARD_NEGATIVES_PATH if config.SYNTHETIC_HARD_NEGATIVES_PATH.exists() else config.HARD_NEGATIVES_PATH
+
+    if not curated_path.exists():
+        raise FileNotFoundError(f"Missing {curated_path}. Run inspect_and_curate.py first.")
+    if not synth_path.exists():
+        raise FileNotFoundError(f"Missing {synth_path}. Run synthesize_hard_negatives.py first.")
         
-    print(f"Loading curated data from {config.CURATED_DATA_PATH}...")
-    with open(config.CURATED_DATA_PATH, "r", encoding="utf-8") as f:
+    print(f"Loading curated data from {curated_path}...")
+    with open(curated_path, "r", encoding="utf-8") as f:
         curated = [json.loads(line) for line in f if line.strip()]
     print(f"Loaded {len(curated)} curated records.")
 
-    print(f"Loading synthetic data from {config.HARD_NEGATIVES_PATH}...")
-    with open(config.HARD_NEGATIVES_PATH, "r", encoding="utf-8") as f:
+    print(f"Loading synthetic data from {synth_path}...")
+    with open(synth_path, "r", encoding="utf-8") as f:
         synthetic = [json.loads(line) for line in f if line.strip()]
     print(f"Loaded {len(synthetic)} synthetic records.")
 
@@ -112,72 +117,55 @@ def process_and_split_dataset() -> Tuple[List[Dict[str, Any]], List[Dict[str, An
     response_template = "<|im_start|>assistant\n"
     response_tokens = tokenizer.encode(response_template, add_special_tokens=False)
 
+    gen_suffix = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+
     def prepare_sft_records(recs: List[Dict[str, Any]], split_name: str) -> List[Dict[str, Any]]:
         sft_data = []
         token_lengths = []
         masked_proportions = []
+        truncated_prompts = 0
 
         for rec in recs:
             messages = build_chatml_messages(rec)
-            # Format text using Qwen's standard Jinja chat template
-            full_text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
+            
+            # 1. Tokenize assistant target (with ChatML end token)
+            target_text = rec["target_json_str"] + "<|im_end|>\n"
+            target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+            
+            # 2. Maximum tokens available for prompt
+            max_prompt_tokens = config.MAX_SEQ_LENGTH - len(target_ids)
+            
+            # 3. Format and tokenize prompt
+            prompt_messages = messages[:2]
+            prompt_res = tokenizer.apply_chat_template(
+                prompt_messages,
+                tokenize=True,
+                add_generation_prompt=True,
             )
-
-            # Tokenize full sequence
-            enc = tokenizer(
-                full_text,
-                truncation=True,
-                max_length=config.MAX_SEQ_LENGTH,
-                add_special_tokens=False,
-            )
-            input_ids = enc["input_ids"]
+            if hasattr(prompt_res, "input_ids"):
+                prompt_ids = list(prompt_res.input_ids)
+            else:
+                prompt_ids = list(prompt_res)
+                
+            # If prompt exceeds budget, truncate prompt, preserving system header & assistant prompt
+            if len(prompt_ids) > max_prompt_tokens:
+                truncated_prompts += 1
+                prompt_ids = prompt_ids[:max_prompt_tokens]
+                prompt_ids[-len(gen_suffix):] = gen_suffix
+                
+            # 4. Concatenate input_ids and construct completion labels
+            input_ids = prompt_ids + target_ids
+            labels = [-100] * len(prompt_ids) + list(target_ids)
+            
+            # Guarantee that every sample has active target tokens
+            n_prompt = len(prompt_ids)
+            n_resp = len(target_ids)
+            assert n_resp > 0, f"Sample {rec['id']} has 0 target tokens!"
+            
             token_lengths.append(len(input_ids))
-
-            # Build completion mask: labels = -100 for prompt tokens
-            # Find the start index of response_template tokens
-            labels = list(input_ids)
-            found_response = False
-            response_len = len(response_tokens)
-
-            for i in range(len(input_ids) - response_len + 1):
-                if input_ids[i : i + response_len] == response_tokens:
-                    # Mask everything up to the end of response_template
-                    cutoff = i + response_len
-                    for j in range(cutoff):
-                        labels[j] = -100
-                    found_response = True
-                    break
-
-            if not found_response:
-                # Fallback: search for single assistant token ID
-                assistant_subtoken = tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
-                for i in range(len(input_ids) - len(assistant_subtoken) + 1):
-                    if input_ids[i : i + len(assistant_subtoken)] == assistant_subtoken:
-                        cutoff = i + len(assistant_subtoken) + 1  # include newline
-                        for j in range(min(cutoff, len(labels))):
-                            labels[j] = -100
-                        found_response = True
-                        break
-
-            # If still not found, fallback to masking prompt text
-            if not found_response:
-                prompt_messages = messages[:2]
-                prompt_text = tokenizer.apply_chat_template(
-                    prompt_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
-                for j in range(min(prompt_len, len(labels))):
-                    labels[j] = -100
-
-            valid, n_prompt, n_resp = verify_completion_mask(
-                input_ids, labels, tokenizer, response_tokens
-            )
             masked_proportions.append(n_prompt / max(1, len(input_ids)))
+
+            full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
             sft_data.append({
                 "id": rec["id"],
@@ -194,7 +182,9 @@ def process_and_split_dataset() -> Tuple[List[Dict[str, Any]], List[Dict[str, An
         print(f"\n--- {split_name.upper()} DATASET METRICS ---")
         print(f"Total samples: {len(sft_data)}")
         print(f"Token length min/mean/median/max: {min(token_lengths)} / {int(np.mean(token_lengths))} / {int(np.median(token_lengths))} / {max(token_lengths)}")
-        print(f"Samples exceeding {config.MAX_SEQ_LENGTH} (truncated): {sum(1 for l in token_lengths if l >= config.MAX_SEQ_LENGTH)}")
+        print(f"Prompts truncated to fit {config.MAX_SEQ_LENGTH}: {truncated_prompts} / {len(sft_data)} ({truncated_prompts/len(sft_data)*100:.1f}%)")
+        print(f"Active target tokens min/mean/max: {min(d['num_target_tokens'] for d in sft_data)} / {int(np.mean([d['num_target_tokens'] for d in sft_data]))} / {max(d['num_target_tokens'] for d in sft_data)}")
+        print(f"Samples with 0 target tokens: {sum(1 for d in sft_data if d['num_target_tokens'] == 0)} (strictly 0)")
         print(f"Average prompt token masking ratio: {np.mean(masked_proportions)*100:.1f}%")
 
         # Tier distribution check
@@ -218,6 +208,17 @@ def process_and_split_dataset() -> Tuple[List[Dict[str, Any]], List[Dict[str, An
     with open(config.SFT_VAL_PATH, "w", encoding="utf-8") as f:
         for rec in val_sft:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # Export Arrow format memory-mapped dataset for zero-RAM training loader
+    print(f"\nExporting Arrow DatasetDict to: {config.SFT_DATASET_DIR}")
+    train_ds = Dataset.from_list(train_sft)
+    val_ds = Dataset.from_list(val_sft)
+    arrow_dataset = DatasetDict({
+        "train": train_ds,
+        "validation": val_ds,
+    })
+    arrow_dataset.save_to_disk(str(config.SFT_DATASET_DIR))
+    print(f"[SUCCESS] Saved memory-mapped dataset to: {config.SFT_DATASET_DIR}")
 
     print("=" * 70)
     print("SFT Dataset Build Completed Successfully.")

@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
+from peft import PeftModel
 
 # Add root directory to sys.path to import config
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -222,11 +229,192 @@ def format_evaluation_prompt(job_description: str, resume: str) -> str:
     return prompt_str
 
 
+def run_evaluation(
+    val_file: Path,
+    adapter_path: Optional[Path] = None,
+    num_samples: int = 20,
+    output_report: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Runs model inference and evaluates JSON schema conformance, MAE, and recommendation accuracy.
+    """
+    val_path = Path(val_file)
+    if not val_path.exists():
+        raise FileNotFoundError(f"Validation file/directory not found: {val_path}")
+
+    print(f"\nLoading validation records from: {val_path}")
+    records = []
+    if val_path.is_dir():
+        from datasets import load_from_disk
+        ds = load_from_disk(str(val_path))
+        split_data = ds["validation"] if (hasattr(ds, "keys") and "validation" in ds) else (ds[list(ds.keys())[0]] if hasattr(ds, "keys") else ds)
+        for i in range(min(num_samples, len(split_data))):
+            records.append(split_data[i])
+    else:
+        with open(val_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+                    if len(records) >= num_samples:
+                        break
+
+    print(f"Loaded {len(records)} validation samples for evaluation.")
+
+    print(f"Loading tokenizer: {config.MODEL_NAME}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.MODEL_NAME,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.MODEL_NAME,
+            trust_remote_code=True,
+            local_files_only=False,
+        )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if config.HAS_CUDA:
+        print(f"Loading base model onto GPU: {torch.cuda.get_device_name(0)}")
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                config.MODEL_NAME,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                attn_implementation=config.ATTN_IMPLEMENTATION,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                local_files_only=True,
+            )
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(
+                config.MODEL_NAME,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                attn_implementation=config.ATTN_IMPLEMENTATION,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                local_files_only=False,
+            )
+    else:
+        print("Loading lightweight base model in CPU mode...")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.MODEL_NAME,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+
+    if adapter_path:
+        adapter_str = str(adapter_path)
+        is_local = Path(adapter_str).exists() and Path(adapter_str).is_dir()
+        if is_local:
+            print(f"Attaching LoRA adapter weights from local directory: {adapter_str}")
+            model = PeftModel.from_pretrained(model, adapter_str)
+        else:
+            print(f"Attaching LoRA adapter weights from Hugging Face Hub: {adapter_str}")
+            try:
+                model = PeftModel.from_pretrained(model, adapter_str)
+            except Exception as e:
+                if config.FINAL_MODEL_DIR.exists():
+                    print(f"[Notice] Hub loading failed ({e}). Falling back to local checkpoint: {config.FINAL_MODEL_DIR}")
+                    model = PeftModel.from_pretrained(model, str(config.FINAL_MODEL_DIR))
+                else:
+                    raise e
+    else:
+        print(f"[Notice] No adapter specified. Running base model evaluation.")
+
+    model.eval()
+
+    predictions = []
+    ground_truths = []
+    raw_results = []
+
+    print("\nRunning inference on validation samples...")
+    for idx, rec in enumerate(records):
+        messages = rec.get("messages", [])
+        if len(messages) < 3:
+            continue
+        
+        prompt_messages = messages[:2]
+        ground_truth_text = messages[2]["content"]
+        gt_parsed, _ = extract_json_from_response(ground_truth_text)
+        if not gt_parsed:
+            continue
+
+        prompt_str = tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        gen_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        response_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        pred_parsed, parse_msg = extract_json_from_response(response_text)
+
+        if pred_parsed is None:
+            pred_parsed = {"overall_score": 0, "category_scores": {}, "recommendation": "Invalid", "summary": "Parse failed"}
+
+        predictions.append(pred_parsed)
+        ground_truths.append(gt_parsed)
+        raw_results.append({
+            "id": rec.get("id", f"sample_{idx}"),
+            "ground_truth_score": gt_parsed.get("overall_score"),
+            "predicted_score": pred_parsed.get("overall_score"),
+            "ground_truth_rec": gt_parsed.get("recommendation"),
+            "predicted_rec": pred_parsed.get("recommendation"),
+            "parse_status": parse_msg,
+        })
+        print(f"  Sample {idx+1}/{len(records)} | GT Score: {gt_parsed.get('overall_score')} | Pred Score: {pred_parsed.get('overall_score')} | Rec: {pred_parsed.get('recommendation')}")
+
+    metrics = compute_metrics(predictions, ground_truths)
+    metrics["detailed_results"] = raw_results
+
+    print("\n" + "=" * 60)
+    print("EVALUATION METRICS SUMMARY:")
+    print("=" * 60)
+    print(f"  Total Samples Evaluated    : {metrics['total_samples']}")
+    print(f"  Schema Conformance Rate    : {metrics['schema_conformance_rate']:.1f}%")
+    print(f"  Overall Score MAE          : {metrics['overall_score_mae']:.2f} (+/- {metrics['overall_score_std']:.2f})")
+    print(f"  Recommendation Accuracy    : {metrics['recommendation_accuracy']:.1f}%")
+    print("  Category-Level MAE:")
+    for cat, mae in metrics.get("category_mae", {}).items():
+        val_str = f"{mae:.2f}" if mae is not None else "N/A"
+        print(f"    - {cat:<30}: {val_str}")
+    print("=" * 60)
+
+    if output_report:
+        out_path = Path(output_report)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Evaluation report saved to: {out_path.resolve()}")
+
+    return metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate AI Resume Reviewer Model")
     parser.add_argument("--test-schema", action="store_true", help="Run schema validator self-test.")
-    parser.add_argument("--val-file", type=str, default=str(config.SFT_VAL_PATH), help="Path to validation JSONL file.")
-    parser.add_argument("--adapter-path", type=str, default=str(config.FINAL_MODEL_DIR), help="Path to trained LoRA adapter.")
+    parser.add_argument("--val-file", "--dataset-path", dest="val_file", type=str, default=str(config.SFT_VAL_PATH), help="Path to validation JSONL file or Arrow dataset directory.")
+    parser.add_argument("--adapter-path", "--model-path", dest="adapter_path", type=str, default=config.DEFAULT_ADAPTER_MODEL, help="Path to trained LoRA adapter.")
     parser.add_argument("--num-samples", type=int, default=20, help="Number of validation samples to evaluate.")
     parser.add_argument("--output-report", type=str, default="evaluation_report.json", help="Path to output metrics JSON.")
     args = parser.parse_args()
@@ -235,11 +423,12 @@ def main():
         run_schema_self_test()
         sys.exit(0)
 
-    print("Evaluation Suite Ready.")
-    print(f"Validation dataset target: {args.val_file}")
-    print(f"Adapter target path: {args.adapter_path}")
-    print("To evaluate after training on target hardware, run:")
-    print("  python evaluate_reviewer.py --val-file data/sft_val.jsonl --adapter-path outputs/final_adapter")
+    run_evaluation(
+        val_file=Path(args.val_file),
+        adapter_path=Path(args.adapter_path),
+        num_samples=args.num_samples,
+        output_report=Path(args.output_report),
+    )
 
 
 if __name__ == "__main__":

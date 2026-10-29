@@ -222,3 +222,44 @@ __marimo__/
 # Project cache & outputs
 data/raw_netsol/
 outputs/
+
+# ==============================================================================
+# AI Resume Reviewer Project Specific Ignores
+# ==============================================================================
+# Model Weights, Checkpoints & Adapters (Loaded from Hugging Face Hub: Kami0867/Qwen-2.5-3B-Resume-Evaluator)
+model_checkpoints/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Entire Dataset Directory and Processed Data Artifacts
+data/
+data/**
+*.jsonl
+*.arrow
+dataset_dict.json
+
+# Training Scripts & Launchers (Excluded from public web app repository)
+train_qlora.py
+run_training.ps1
+
+# SQLite Database & Session Persistence (Keeps candidate PII out of git)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Training & Process Logs
+*.log
+training_run.log
+
+# Evaluation Reports
+evaluation_report.json
+
+# Caches & OS Artifacts
+.cache/
+hf_cache/
+.DS_Store
+Thumbs.db

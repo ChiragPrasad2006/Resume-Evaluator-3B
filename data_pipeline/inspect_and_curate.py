@@ -229,11 +229,33 @@ def extract_strengths_and_weaknesses(
     return strengths[:4], weaknesses[:4], feedback[:3]
 
 
-def process_dataset(download_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+def process_dataset(download_dir: Optional[Path] = None, force: bool = False) -> List[Dict[str, Any]]:
     """Downloads netsol/resume-score-details repository and curates all valid samples."""
     print("=" * 70)
     print("STEP 1: Downloading & Curating 'netsol/resume-score-details'")
     print("=" * 70)
+
+    target_processed_path = config.BASE_CURATED_PATH
+    config.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Sync existing curated data to processed path if needed
+    if not target_processed_path.exists() and config.CURATED_DATA_PATH.exists() and config.CURATED_DATA_PATH.stat().st_size > 0:
+        import shutil
+        shutil.copy2(config.CURATED_DATA_PATH, target_processed_path)
+        print(f"[SYNC] Mirrored existing curated data to: {target_processed_path}")
+
+    # Skip downloading/re-processing if target already exists and is non-empty
+    if not force and target_processed_path.exists() and target_processed_path.stat().st_size > 0:
+        print(f"[SKIP] Curated dataset already exists and is non-empty at: {target_processed_path}")
+        print("Pass --force to re-download and re-process from scratch.")
+        existing_records = []
+        with open(target_processed_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    existing_records.append(json.loads(line))
+        print(f"Loaded {len(existing_records)} existing curated records cleanly.")
+        return existing_records
 
     raw_cache_dir = config.DATA_DIR / "raw_netsol"
     raw_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -355,11 +377,12 @@ def process_dataset(download_dir: Optional[Path] = None) -> List[Dict[str, Any]]
         })
         stats["valid"] += 1
 
-    # Save to curated_resumes.jsonl
-    print(f"\nWriting {len(curated_records)} curated records to: {config.CURATED_DATA_PATH}")
-    with open(config.CURATED_DATA_PATH, "w", encoding="utf-8") as f:
-        for rec in curated_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Save to curated_resumes.jsonl and base_curated.jsonl
+    for save_path in [config.CURATED_DATA_PATH, config.BASE_CURATED_PATH]:
+        print(f"\nWriting {len(curated_records)} curated records to: {save_path}")
+        with open(save_path, "w", encoding="utf-8") as f:
+            for rec in curated_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # Display dataset statistics
     print("\n" + "=" * 50)
@@ -381,4 +404,8 @@ def process_dataset(download_dir: Optional[Path] = None) -> List[Dict[str, Any]]
 
 
 if __name__ == "__main__":
-    process_dataset()
+    import argparse
+    parser = argparse.ArgumentParser(description="Inspect & Curate Resume Dataset")
+    parser.add_argument("--force", action="store_true", help="Force re-download and re-process even if data exists.")
+    args = parser.parse_args()
+    process_dataset(force=args.force)

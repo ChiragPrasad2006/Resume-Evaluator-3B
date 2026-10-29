@@ -152,16 +152,48 @@ MUTATION_FUNCTIONS = [
 
 def generate_hard_negatives(
     target_count: int = 500,
-    input_file: Path = config.CURATED_DATA_PATH,
-    output_file: Path = config.HARD_NEGATIVES_PATH,
+    input_file: Path = config.BASE_CURATED_PATH,
+    output_file: Path = config.SYNTHETIC_HARD_NEGATIVES_PATH,
+    force: bool = False,
 ) -> List[Dict[str, Any]]:
     """Generates synthetic hard negative and borderline training pairs from curated seeds."""
     print("=" * 70)
-    print(f"STEP 2: Synthesizing {target_count} Hard Negatives & Borderlines")
+    print(f"STEP 2: Synthesizing {target_count} Hard Negatives & Borderlines (Atomic Resume)")
     print("=" * 70)
 
     if not input_file.exists():
-        raise FileNotFoundError(f"Curated dataset not found at {input_file}. Run inspect_and_curate.py first.")
+        if config.CURATED_DATA_PATH.exists():
+            input_file = config.CURATED_DATA_PATH
+        else:
+            raise FileNotFoundError(f"Curated dataset not found at {input_file}. Run inspect_and_curate.py first.")
+
+    config.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Sync existing hard negatives to processed path if needed
+    if not output_file.exists() and config.HARD_NEGATIVES_PATH.exists() and config.HARD_NEGATIVES_PATH.stat().st_size > 0:
+        import shutil
+        shutil.copy2(config.HARD_NEGATIVES_PATH, output_file)
+        print(f"[SYNC] Mirrored existing synthetic negatives to: {output_file}")
+
+    # Read existing records from output file to resume exactly where left off
+    existing_records: List[Dict[str, Any]] = []
+    existing_ids = set()
+    if output_file.exists() and not force:
+        with open(output_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rec = json.loads(line)
+                    existing_records.append(rec)
+                    existing_ids.add(rec.get("id"))
+
+    if len(existing_records) >= target_count and not force:
+        print(f"[SKIP] Synthetic dataset already complete with {len(existing_records)} samples at: {output_file}")
+        print("Pass --force to regenerate from scratch.")
+        return existing_records
+
+    if existing_records:
+        print(f"[RESUME] Found {len(existing_records)} existing synthetic samples. Resuming generation...")
 
     with open(input_file, "r", encoding="utf-8") as f:
         seed_records = [json.loads(line) for line in f if line.strip()]
@@ -170,105 +202,125 @@ def generate_hard_negatives(
     seed_records.sort(key=lambda x: x["overall_score"], reverse=True)
     seeds_pool = seed_records[: min(len(seed_records), 450)]
 
-    synthetic_records: List[Dict[str, Any]] = []
+    synthetic_records: List[Dict[str, Any]] = list(existing_records)
     pathology_distribution: Dict[str, int] = {}
     tier_distribution = {"Borderline": 0, "Reject": 0}
 
-    for i in range(target_count):
-        seed = seeds_pool[i % len(seeds_pool)]
-        mutation_name, mutation_func = MUTATION_FUNCTIONS[i % len(MUTATION_FUNCTIONS)]
-        pathology_distribution[mutation_name] = pathology_distribution.get(mutation_name, 0) + 1
+    for rec in existing_records:
+        path = rec.get("pathology", "unknown")
+        pathology_distribution[path] = pathology_distribution.get(path, 0) + 1
+        tier = rec.get("score_tier", "Reject")
+        tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
 
-        raw_resume = seed["resume"]
-        raw_jd = seed["job_description"]
-        orig_output = seed["structured_output"]
+    file_mode = "w" if force else "a"
+    out_fh = open(output_file, file_mode, encoding="utf-8")
+    orig_fh = open(config.HARD_NEGATIVES_PATH, file_mode, encoding="utf-8")
 
-        # Apply specific mutation
-        if mutation_name == "missing_hard_requirement":
-            mutated_resume, added_red_flags, penalty = mutation_func(raw_resume, raw_jd)
-        else:
-            mutated_resume, added_red_flags, penalty = mutation_func(raw_resume)
+    try:
+        for i in range(target_count):
+            mutation_name, mutation_func = MUTATION_FUNCTIONS[i % len(MUTATION_FUNCTIONS)]
+            synth_id = f"synth_{mutation_name}_{i+1:04d}"
 
-        # Calibrate penalized scores
-        orig_score = orig_output["overall_score"]
-        new_overall = max(18, min(68, orig_score - penalty))
+            if synth_id in existing_ids:
+                continue
 
-        orig_cats = orig_output["category_scores"]
-        new_tech = max(15, min(75, orig_cats["technical_skills"] - (penalty if "buzzword" in mutation_name or "metric" in mutation_name else penalty // 2)))
-        new_exp = max(15, min(70, orig_cats["experience_relevance"] - (penalty if "seniority" in mutation_name or "conflict" in mutation_name else penalty // 2)))
-        new_edu = max(15, min(70, orig_cats["education_and_certifications"] - (penalty * 2 if "missing" in mutation_name else 5)))
-        new_lead = max(10, min(65, orig_cats["leadership_and_impact"] - (penalty if "metric" in mutation_name or "seniority" in mutation_name else penalty // 3)))
+            seed = seeds_pool[i % len(seeds_pool)]
+            pathology_distribution[mutation_name] = pathology_distribution.get(mutation_name, 0) + 1
 
-        new_category_scores = {
-            "technical_skills": new_tech,
-            "experience_relevance": new_exp,
-            "education_and_certifications": new_edu,
-            "leadership_and_impact": new_lead,
-        }
+            raw_resume = seed["resume"]
+            raw_jd = seed["job_description"]
+            orig_output = seed["structured_output"]
 
-        recommendation = "Borderline" if new_overall >= 50 else "Reject"
-        tier_distribution[recommendation] += 1
+            # Apply specific mutation
+            if mutation_name == "missing_hard_requirement":
+                mutated_resume, added_red_flags, penalty = mutation_func(raw_resume, raw_jd)
+            else:
+                mutated_resume, added_red_flags, penalty = mutation_func(raw_resume)
 
-        # Build updated strengths and weaknesses
-        # Retain 1-2 residual strengths to teach nuanced discernment
-        residual_strengths = orig_output.get("strengths", [])[:2]
-        if not residual_strengths:
-            residual_strengths = ["Familiarity with general industry nomenclature and tooling."]
+            # Calibrate penalized scores
+            orig_score = orig_output["overall_score"]
+            new_overall = max(18, min(68, orig_score - penalty))
 
-        combined_weaknesses = added_red_flags + orig_output.get("weaknesses_and_red_flags", [])[:1]
+            orig_cats = orig_output["category_scores"]
+            new_tech = max(15, min(75, orig_cats["technical_skills"] - (penalty if "buzzword" in mutation_name or "metric" in mutation_name else penalty // 2)))
+            new_exp = max(15, min(70, orig_cats["experience_relevance"] - (penalty if "seniority" in mutation_name or "conflict" in mutation_name else penalty // 2)))
+            new_edu = max(15, min(70, orig_cats["education_and_certifications"] - (penalty * 2 if "missing" in mutation_name else 5)))
+            new_lead = max(10, min(65, orig_cats["leadership_and_impact"] - (penalty if "metric" in mutation_name or "seniority" in mutation_name else penalty // 3)))
 
-        # Generate targeted feedback
-        feedback = []
-        if "buzzword" in mutation_name:
-            feedback.append("Eliminate uncontextualized skill laundry lists; anchor each technology to a verifiable project.")
-        elif "metric" in mutation_name:
-            feedback.append("Rewrite bullet points using XYZ format: Accomplished [X] as measured by [Y] by doing [Z].")
-        elif "seniority" in mutation_name:
-            feedback.append("Align job title accurately with actual scope, responsibilities, and verifiable career tenure.")
-        elif "conflict" in mutation_name:
-            feedback.append("Clarify employment timeline, resolve concurrent commitments, and explain overlapping dates.")
-        else:
-            feedback.append("Ensure mandatory educational credentials and certifications required by the position are satisfied.")
+            new_category_scores = {
+                "technical_skills": new_tech,
+                "experience_relevance": new_exp,
+                "education_and_certifications": new_edu,
+                "leadership_and_impact": new_lead,
+            }
 
-        summary = (
-            f"Candidate profile scored at {new_overall}/100 with critical reservations. "
-            f"While basic domain background is present, the evaluation is heavily compromised by {added_red_flags[0].lower()} "
-            f"Recommended outcome: {recommendation}."
-        )
+            recommendation = "Borderline" if new_overall >= 50 else "Reject"
+            tier_distribution[recommendation] += 1
 
-        structured_output = {
-            "overall_score": new_overall,
-            "summary": summary,
-            "category_scores": new_category_scores,
-            "strengths": residual_strengths,
-            "weaknesses_and_red_flags": combined_weaknesses[:4],
-            "recommendation": recommendation,
-            "actionable_feedback": feedback[:3],
-        }
+            residual_strengths = orig_output.get("strengths", [])[:2]
+            if not residual_strengths:
+                residual_strengths = ["Familiarity with general industry nomenclature and tooling."]
 
-        # Validate schema compliance
-        assert config.REQUIRED_JSON_KEYS.issubset(structured_output.keys())
-        assert config.REQUIRED_CATEGORY_KEYS.issubset(structured_output["category_scores"].keys())
+            combined_weaknesses = added_red_flags + orig_output.get("weaknesses_and_red_flags", [])[:1]
 
-        synth_id = f"synth_{mutation_name}_{i+1:04d}"
-        synthetic_records.append({
-            "id": synth_id,
-            "source": f"synthetic_{mutation_name}",
-            "seed_id": seed["id"],
-            "pathology": mutation_name,
-            "job_description": raw_jd,
-            "resume": mutated_resume,
-            "structured_output": structured_output,
-            "target_json_str": json.dumps(structured_output, indent=2),
-            "overall_score": new_overall,
-            "score_tier": recommendation,
-        })
+            feedback = []
+            if "buzzword" in mutation_name:
+                feedback.append("Eliminate uncontextualized skill laundry lists; anchor each technology to a verifiable project.")
+            elif "metric" in mutation_name:
+                feedback.append("Rewrite bullet points using XYZ format: Accomplished [X] as measured by [Y] by doing [Z].")
+            elif "seniority" in mutation_name:
+                feedback.append("Align job title accurately with actual scope, responsibilities, and verifiable career tenure.")
+            elif "conflict" in mutation_name:
+                feedback.append("Clarify employment timeline, resolve concurrent commitments, and explain overlapping dates.")
+            else:
+                feedback.append("Ensure mandatory educational credentials and certifications required by the position are satisfied.")
 
-    # Save to hard_negatives.jsonl
-    print(f"\nWriting {len(synthetic_records)} synthetic hard negatives to: {output_file}")
-    with open(output_file, "w", encoding="utf-8") as f:
-        for rec in synthetic_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            summary = (
+                f"Candidate profile scored at {new_overall}/100 with critical reservations. "
+                f"While basic domain background is present, the evaluation is heavily compromised by {added_red_flags[0].lower()} "
+                f"Recommended outcome: {recommendation}."
+            )
+
+            structured_output = {
+                "overall_score": new_overall,
+                "summary": summary,
+                "category_scores": new_category_scores,
+                "strengths": residual_strengths,
+                "weaknesses_and_red_flags": combined_weaknesses[:4],
+                "recommendation": recommendation,
+                "actionable_feedback": feedback[:3],
+            }
+
+            assert config.REQUIRED_JSON_KEYS.issubset(structured_output.keys())
+            assert config.REQUIRED_CATEGORY_KEYS.issubset(structured_output["category_scores"].keys())
+
+            record = {
+                "id": synth_id,
+                "source": f"synthetic_{mutation_name}",
+                "seed_id": seed["id"],
+                "pathology": mutation_name,
+                "job_description": raw_jd,
+                "resume": mutated_resume,
+                "structured_output": structured_output,
+                "target_json_str": json.dumps(structured_output, indent=2),
+                "overall_score": new_overall,
+                "score_tier": recommendation,
+            }
+
+            record_line = json.dumps(record, ensure_ascii=False) + "\n"
+            out_fh.write(record_line)
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+
+            orig_fh.write(record_line)
+            orig_fh.flush()
+            os.fsync(orig_fh.fileno())
+
+            synthetic_records.append(record)
+            existing_ids.add(synth_id)
+    finally:
+        out_fh.close()
+        orig_fh.close()
 
     print("\n" + "=" * 50)
     print("SYNTHETIC DATA SUMMARY STATISTICS:")
@@ -279,14 +331,20 @@ def generate_hard_negatives(
         print(f"  - {path_name:26s}: {count:4d}")
     print("\nScore Tier Breakdown:")
     for tier, count in tier_distribution.items():
-        pct = (count / len(synthetic_records)) * 100
+        pct = (count / max(1, len(synthetic_records))) * 100
         print(f"  - {tier:12s}: {count:4d} ({pct:5.1f}%)")
     scores = [r["overall_score"] for r in synthetic_records]
-    print(f"\nScore Range: [{min(scores)} - {max(scores)}], Mean: {sum(scores)/len(scores):.1f}")
+    if scores:
+        print(f"\nScore Range: [{min(scores)} - {max(scores)}], Mean: {sum(scores)/len(scores):.1f}")
     print("=" * 50)
 
     return synthetic_records
 
 
 if __name__ == "__main__":
-    generate_hard_negatives(target_count=500)
+    import argparse
+    parser = argparse.ArgumentParser(description="Synthesize Hard Negatives & Borderlines")
+    parser.add_argument("--target-count", type=int, default=500, help="Number of synthetic samples to generate.")
+    parser.add_argument("--force", action="store_true", help="Force regeneration even if dataset exists.")
+    args = parser.parse_args()
+    generate_hard_negatives(target_count=args.target_count, force=args.force)

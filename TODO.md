@@ -47,3 +47,81 @@ Live Implementation and Verification Checklist
   - [x] Validated data curation and SFT generation pipeline
   - [x] Validated schema conformance tests (`python evaluate_reviewer.py --test-schema`)
   - [x] Production deployment instructions documented for RTX 5060 Ti training run
+
+## [OOM & Checkpoint Recovery Plan]
+- [x] **Fix 1: Hard Memory Caps & Windows RAM Protection**
+  - [x] Update `config.py` with `expandable_segments:True,max_split_size_mb:64` and `set_per_process_memory_fraction(0.85)`
+  - [x] Set `dataloader_num_workers = 0` and `dataloader_pin_memory = False` in `config.py` & `train_qlora.py`
+  - [x] Lower `max_seq_length = 1400`, set `prediction_loss_only = True`
+  - [x] Enable `model.enable_input_require_grads()` and `model.config.use_cache = False`
+  - [x] Adjust hyperparameters: `per_device_train_batch_size = 1`, `gradient_accumulation_steps = 8`, `learning_rate = 8e-5`
+  - [x] Compact LoRA configuration: `r = 12`, `lora_alpha = 24`, `lora_dropout = 0.08`
+- [x] **Fix 2: Aggressive, Crash-Proof Checkpointing & Auto-Resume**
+  - [x] Configure `save_strategy = "steps"`, `save_steps = 5`, `save_total_limit = 3`, `eval_steps = 5` (aligned for `load_best_model_at_end`)
+  - [x] Implement automatic checkpoint detection and resumption via `get_last_checkpoint`
+  - [x] Wrap `trainer.train(...)` with `try...except (KeyboardInterrupt, RuntimeError, Exception)` for emergency adapter saves to `outputs/emergency_interrupt_checkpoint`
+  - [x] Implement `MemoryCleanCallback` with explicit GC and `torch.cuda.empty_cache()` on step end (every 2 steps), evaluate, save, and log VRAM & System RAM %
+- [x] **Fix 3: Atomic Per-Row Save Points in Data Pipeline**
+  - [x] Update `inspect_and_curate.py` with skip check for `data/processed/base_curated.jsonl` (unless `--force`)
+  - [x] Update `synthesize_hard_negatives.py` with resume from existing source_id/hashes and atomic flush/fsync per row
+  - [x] Update `build_sft_dataset.py` to save `DatasetDict` to `data/processed/sft_dataset` for zero-RAM memory-mapped loading
+- [x] **Verification & Validation**
+  - [x] Rebuilt `sft_dataset` with 100% target JSON preservation (zero samples with NaN loss)
+  - [x] Resolved `TrainOutput.total_flos` attribute error via safe `getattr` fallback
+  - [x] Run `train_qlora.py --dry-run` (verified decreasing eval loss 1.665 -> 1.649, Peak VRAM 5.20 GB < 6.80 GB, System RAM 62.3% < 75%)
+  - [x] Cleaned dry-run checkpoints; verified clean state for full production run via `run_training.ps1`
+  - [x] Completed full production training run (432/432 steps, final adapter saved to `model_checkpoints/final_adapter`)
+
+## [Production Web UI Plan]
+- [x] **1. SQLite Persistence Layer (`data/sessions.db`)**
+  - [x] Schema creation: `sessions` table (id, title, raw_jd, compact_jd, created_at, updated_at)
+  - [x] Schema creation: `evaluations` table (id, session_id, candidate_name, raw_resume, overall_score, recommendation, parsed_json, created_at)
+  - [x] Data access functions: create/list/get/delete session, add evaluation, export session to CSV/JSON
+- [x] **2. JD Token Budgeting & Requirements Processor (`web/jd_processor.py`)**
+  - [x] Token count calculation using Qwen tokenizer heuristic
+  - [x] Role title extraction from first line/header
+  - [x] Smart extractive summarizer for JDs > 800 tokens to ensure total prompt stays under 1400 tokens
+- [x] **3. Warm Singleton Inference Engine (`web/inference_engine.py`)**
+  - [x] Load base Qwen 2.5 3B in 4-bit NF4 (`bitsandbytes`) with `bfloat16` compute dtype
+  - [x] Attach fine-tuned LoRA adapter from `model_checkpoints/final_adapter`
+  - [x] Strict non-drifting context builder: `[System Instruction] + [Active JD] + [Candidate Resume]`
+  - [x] Robust JSON response extraction & fallback validation
+  - [x] Keep VRAM allocations under 4.5 GB with memory cleanup (Measured Peak: 2.16 GB / 8.0 GB)
+- [x] **4. Resume File Ingestion & Parsing (`web/file_parser.py`)**
+  - [x] Text parser for pasted resume strings
+  - [x] PDF parser using `pypdf`
+  - [x] DOCX parser using `python-docx`
+- [x] **5. Modern Dark-Themed SPA Interface & Sound Integration (`web/static/index.html`)**
+  - [x] Collapsible sidebar with session list grouped by date ("Today", "Previous 7 Days", etc.)
+  - [x] Anchored collapsible "Target Job Description" header banner
+  - [x] Candidate evaluation stream with rich cards (circular score meter, category bars, skill chips, raw JSON toggle)
+  - [x] Responsive input dock with file drag-and-drop & paste
+  - [x] Embedded zero-dependency procedural Web Audio sound synthesizer (`ui-sound-explorer`: `pop`, `chime`, `whisk`, `sigh`, `hire`)
+- [x] **6. FastAPI Application (`web/app.py`)**
+  - [x] REST API routes for sessions, JD submission, candidate evaluation, file upload, and exports
+  - [x] Static file serving for SPA
+- [x] **7. Launcher & End-to-End Verification (`run_ui.ps1`)**
+  - [x] Created `run_ui.ps1` PowerShell launcher
+  - [x] Tested session creation with sample JD
+  - [x] Tested candidate evaluation on multiple resumes (Strong Hire vs Reject)
+  - [x] Verified VRAM Peak 2.16 GB (< 4.5 GB) and session persistence across reloads
+
+## [8-Bit Inference Engine Upgrade (BitsAndBytes INT8)]
+- [x] **1. 8-Bit BitsAndBytes Quantization Configuration (`web/inference_engine.py`)**
+  - [x] Configured `BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=False, llm_int8_threshold=6.0)`
+  - [x] Loaded base model `Qwen/Qwen2.5-3B-Instruct` with `device_map="cuda:0"`, `attn_implementation="sdpa"`, and `dtype=torch.float16` to eliminate casting overhead
+  - [x] Attached trained LoRA adapter from `model_checkpoints/final_adapter`
+  - [x] Set `model.eval()` and `model.config.use_cache = True` for fast auto-regressive generation
+- [x] **2. Deterministic Generation & Memory Safeguards**
+  - [x] Wrapped generation inside `with torch.inference_mode():`
+  - [x] Tokenized inputs with Qwen ChatML template to `cuda:0`
+  - [x] Configured generation parameters: `max_new_tokens=768`, greedy decoding (`do_sample=False`), `repetition_penalty=1.05`, `eos_token_id=151645 (<|im_end|>)`
+  - [x] Extracted newly generated tokens `outputs[0][inputs["input_ids"].shape[-1]:]` and purged activation tensors with `torch.cuda.empty_cache()`
+- [x] **3. Diagnostic Telemetry & Verification**
+  - [x] Added startup VRAM diagnostic `[8-BIT INFERENCE READY]`
+  - [x] Exposed `get_reviewer_model()` programmatic accessor for CLI and tests
+  - [x] Verified baseline VRAM: Allocated 3.25 GB, Reserved 4.31 GB (< 4.5 GB budget)
+  - [x] Verified peak generation VRAM: 3.40 GB (< 4.5 GB target)
+  - [x] Verified schema extraction & evaluation output (Score: 70, Outcome: "Hire", valid JSON keys) without 4-bit precision drift
+  - [x] Replaced hardcoded static "4-bit NF4" strings in `web/static/index.html` with dynamic `/api/model/status` endpoint reading live PyTorch metadata (`Qwen/Qwen2.5-3B-Instruct`, `8-bit INT8 (BitsAndBytes)`, `3.25 GB` VRAM on `RTX 5060 Ti`)
+  - [x] Removed extraneous audio synthesizers and sound button from UI footer for a clean, distraction-free interface

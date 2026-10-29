@@ -1,0 +1,13 @@
+# AI Resume Reviewer Requirements
+torch>=2.4.0
+transformers>=4.48.0
+peft>=0.14.0
+bitsandbytes>=0.45.0
+accelerate>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+pypdf>=5.0.0
+datasets>=3.0.0
+huggingface_hub>=0.28.0
+numpy>=1.26.0

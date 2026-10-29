@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local AI Resume Reviewer — Qwen 2.5 3B QLoRA</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              100: '#dcfce7',
+              500: '#22c55e',
+              600: '#16a34a',
+              700: '#15803d',
+            },
+            surface: {
+              50: '#18181b',
+              100: '#27272a',
+              200: '#3f3f46',
+              800: '#09090b',
+              900: '#050506',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Custom scrollbars */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+    .score-circle {
+      transition: stroke-dashoffset 1s ease-in-out;
+      transform: rotate(-90deg);
+      transform-origin: 50% 50%;
+    }
+  </style>
+</head>
+<body class="bg-[#0c0d0e] text-zinc-100 font-sans antialiased h-screen overflow-hidden flex flex-col">
+
+  <div class="flex-1 flex overflow-hidden">
+    <!-- LEFT SIDEBAR -->
+    <aside id="sidebar" class="w-80 bg-[#121316] border-r border-zinc-800/80 flex flex-col transition-all duration-300 z-30 shrink-0">
+      <!-- App Header -->
+      <div class="p-4 border-b border-zinc-800/80 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-lg shadow-emerald-950/40">
+            <i data-lucide="sparkles" class="w-5 h-5 text-white"></i>
+          </div>
+          <div>
+            <h1 class="text-sm font-semibold tracking-wide text-zinc-100 flex items-center gap-1.5">
+              Resume Reviewer
+              <span class="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20 font-mono">3B • 8-bit INT8</span>
+            </h1>
+            <p class="text-[11px] text-zinc-400">Local RTX 5060 Ti Engine</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Action: New Job Button -->
+      <div class="p-3">
+        <button id="btn-new-session" class="w-full py-2.5 px-3 bg-zinc-800/90 hover:bg-zinc-700/80 text-zinc-200 hover:text-white rounded-lg text-sm font-medium flex items-center justify-center gap-2 border border-zinc-700/60 shadow-sm transition">
+          <i data-lucide="plus" class="w-4 h-4 text-emerald-400"></i>
+          <span>+ New Job / Screening</span>
+        </button>
+      </div>
+
+      <!-- Sessions List -->
+      <div class="flex-1 overflow-y-auto px-3 py-2 space-y-4" id="sessions-container">
+        <!-- Rendered dynamically -->
+        <div class="text-xs text-zinc-500 text-center py-6">Loading sessions...</div>
+      </div>
+
+      <!-- Sidebar Footer (Dynamic PyTorch Telemetry) -->
+      <div class="p-3 border-t border-zinc-800/80 bg-[#0e0f11] flex items-center justify-between text-xs text-zinc-400">
+        <div class="flex items-center gap-2 min-w-0">
+          <span id="gpu-dot" class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
+          <span id="gpu-status" class="truncate font-mono text-[11px]" title="Connecting to PyTorch backend...">Connecting...</span>
+        </div>
+        <span id="gpu-device-badge" class="text-[10px] bg-zinc-800/80 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-700/50 shrink-0 font-mono">RTX 5060 Ti</span>
+      </div>
+    </aside>
+
+    <!-- MAIN WORKSPACE -->
+    <main class="flex-1 flex flex-col bg-[#0c0d0e] overflow-hidden relative">
+      <!-- Top Bar -->
+      <header class="h-14 border-b border-zinc-800/80 bg-[#121316]/90 backdrop-blur px-4 flex items-center justify-between shrink-0 z-20">
+        <div class="flex items-center gap-3">
+          <button id="btn-toggle-sidebar" class="p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-200 transition">
+            <i data-lucide="panel-left-close" class="w-5 h-5"></i>
+          </button>
+          <div class="flex items-center gap-2">
+            <h2 id="header-job-title" class="text-sm font-medium text-zinc-200 truncate max-w-md">No Active Job</h2>
+            <span id="header-cand-count" class="hidden text-xs bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded-full font-mono">0 candidates</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2" id="header-actions">
+          <button id="btn-export-csv" class="hidden px-2.5 py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-md border border-zinc-700 flex items-center gap-1.5 transition">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i>
+            Export CSV
+          </button>
+          <button id="btn-export-json" class="hidden px-2.5 py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-md border border-zinc-700 flex items-center gap-1.5 transition">
+            <i data-lucide="file-json" class="w-3.5 h-3.5"></i>
+            JSON
+          </button>
+        </div>
+      </header>
+
+      <!-- ANCHORED JOB DESCRIPTION BANNER -->
+      <div id="anchored-jd-banner" class="hidden border-b border-zinc-800/80 bg-[#15171c]/95 px-5 py-3 transition-all z-10 shrink-0">
+        <div class="flex items-start justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-[11px] font-semibold tracking-wider text-emerald-400 uppercase flex items-center gap-1">
+                <i data-lucide="anchor" class="w-3 h-3"></i> Anchored Target Job Description
+              </span>
+              <span id="jd-compact-badge" class="hidden text-[10px] bg-amber-500/10 text-amber-400 px-1.5 py-0.2 rounded border border-amber-500/20">Compacted for 1400 seq</span>
+            </div>
+            <div id="jd-text-preview" class="text-xs text-zinc-300 line-clamp-2 leading-relaxed font-mono whitespace-pre-line"></div>
+            <div id="jd-text-full" class="hidden text-xs text-zinc-300 max-h-48 overflow-y-auto mt-2 p-2.5 bg-black/40 rounded border border-zinc-800/80 font-mono whitespace-pre-line"></div>
+          </div>
+          <button id="btn-toggle-jd-expand" class="text-xs text-emerald-400 hover:text-emerald-300 font-medium shrink-0 flex items-center gap-1 mt-1 transition">
+            <span id="jd-expand-label">Expand JD</span>
+            <i id="jd-expand-icon" data-lucide="chevron-down" class="w-3.5 h-3.5"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- CHAT / EVALUATION STREAM CONTAINER -->
+      <div id="chat-stream" class="flex-1 overflow-y-auto px-4 sm:px-6 md:px-12 py-6 space-y-6">
+        <!-- INITIAL EMPTY STATE: PROMPT TO PASTE JD -->
+        <div id="empty-state-jd" class="max-w-2xl mx-auto my-12 p-8 bg-[#131418] border border-zinc-800/90 rounded-2xl shadow-xl">
+          <div class="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center mb-4">
+            <i data-lucide="briefcase" class="w-6 h-6"></i>
+          </div>
+          <h3 class="text-lg font-semibold text-zinc-100 mb-1">Step 1: Set Target Job Description</h3>
+          <p class="text-sm text-zinc-400 mb-5 leading-relaxed">
+            Paste the target Job Description to anchor this screening session. All candidate resumes evaluated in this thread will be rigorously benchmarked against these exact requirements.
+          </p>
+
+          <div class="space-y-3">
+            <textarea id="input-jd-text" rows="7" placeholder="Paste full Job Description here (Role, Responsibilities, Hard Requirements, Tech Stack)..." class="w-full bg-[#0a0a0c] border border-zinc-700/80 rounded-xl p-3.5 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/60 focus:ring-1 focus:ring-emerald-500/40 transition font-mono"></textarea>
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-zinc-500 flex items-center gap-1">
+                <i data-lucide="shield-check" class="w-3.5 h-3.5 text-emerald-500"></i>
+                JDs over 800 tokens will be automatically compacted to preserve sequence budget.
+              </span>
+              <button id="btn-submit-jd" class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-emerald-950/50 flex items-center gap-2 transition disabled:opacity-50">
+                <i data-lucide="check" class="w-4 h-4"></i>
+                Initialize Job Session
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- EVALUATIONS FEED (Appended dynamically) -->
+        <div id="evaluations-feed" class="max-w-3xl mx-auto space-y-6"></div>
+      </div>
+
+      <!-- FLOATING INPUT DOCK -->
+      <div id="input-dock-container" class="p-4 bg-gradient-to-t from-[#0c0d0e] via-[#0c0d0e]/90 to-transparent shrink-0">
+        <div class="max-w-3xl mx-auto">
+          <!-- File upload drag status banner -->
+          <div id="file-chip" class="hidden mb-2 px-3 py-1.5 bg-zinc-800/90 border border-zinc-700 rounded-lg text-xs text-zinc-200 flex items-center justify-between">
+            <div class="flex items-center gap-2 truncate">
+              <i data-lucide="file-text" class="w-4 h-4 text-emerald-400 shrink-0"></i>
+              <span id="file-chip-name" class="truncate font-mono">resume.pdf</span>
+              <span id="file-chip-size" class="text-zinc-500 text-[11px]">(0 KB)</span>
+            </div>
+            <button id="btn-remove-file" class="text-zinc-400 hover:text-zinc-200 p-1">
+              <i data-lucide="x" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+
+          <!-- Main Input Bar -->
+          <div id="drop-zone" class="bg-[#14151a] border border-zinc-700/80 rounded-2xl shadow-2xl p-2.5 flex items-end gap-2 focus-within:border-emerald-500/50 focus-within:ring-1 focus-within:ring-emerald-500/30 transition">
+            <!-- Upload File Button -->
+            <label class="p-2.5 hover:bg-zinc-800/80 text-zinc-400 hover:text-zinc-200 rounded-xl cursor-pointer transition shrink-0" title="Upload Resume (.pdf, .docx, .txt)">
+              <i data-lucide="paperclip" class="w-4 h-4"></i>
+              <input type="file" id="file-input" class="hidden" accept=".pdf,.docx,.txt">
+            </label>
+
+            <!-- Textarea -->
+            <textarea id="input-resume-text" rows="1" placeholder="Paste candidate resume or profile text here (or drag & drop PDF/DOCX)..." class="flex-1 bg-transparent border-0 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none resize-none py-2 px-1 max-h-36 font-sans leading-relaxed"></textarea>
+
+            <!-- Submit Button -->
+            <button id="btn-submit-eval" disabled class="p-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl shadow-md shadow-emerald-950/40 transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0 flex items-center justify-center">
+              <i id="icon-submit" data-lucide="arrow-up" class="w-4 h-4"></i>
+              <i id="icon-spinner" data-lucide="loader-2" class="w-4 h-4 animate-spin hidden"></i>
+            </button>
+          </div>
+          <div class="flex items-center justify-between px-2 pt-1.5 text-[11px] text-zinc-500">
+            <span>Strict non-drifting context: Previous candidates are never injected into the prompt.</span>
+            <span id="vram-stat" class="font-mono text-zinc-400">VRAM Budget: &lt; 4.5 GB</span>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Main SPA Client Logic & Live Model Telemetry -->
+  <script>
+    let activeSession = null;
+    let sessions = [];
+    let pendingFile = null;
+    let currentModelInfo = null;
+
+    // DOM Elements
+    const sessionsContainer = document.getElementById("sessions-container");
+    const emptyStateJD = document.getElementById("empty-state-jd");
+    const anchoredJDBanner = document.getElementById("anchored-jd-banner");
+    const jdTextPreview = document.getElementById("jd-text-preview");
+    const jdTextFull = document.getElementById("jd-text-full");
+    const jdCompactBadge = document.getElementById("jd-compact-badge");
+    const jdExpandLabel = document.getElementById("jd-expand-label");
+    const jdExpandIcon = document.getElementById("jd-expand-icon");
+    const headerJobTitle = document.getElementById("header-job-title");
+    const headerCandCount = document.getElementById("header-cand-count");
+    const headerActions = document.getElementById("header-actions");
+    const evaluationsFeed = document.getElementById("evaluations-feed");
+    const inputResumeText = document.getElementById("input-resume-text");
+    const btnSubmitEval = document.getElementById("btn-submit-eval");
+    const btnSubmitJD = document.getElementById("btn-submit-jd");
+    const inputJDText = document.getElementById("input-jd-text");
+    const fileInput = document.getElementById("file-input");
+    const fileChip = document.getElementById("file-chip");
+    const fileChipName = document.getElementById("file-chip-name");
+    const fileChipSize = document.getElementById("file-chip-size");
+    const btnRemoveFile = document.getElementById("btn-remove-file");
+    const dropZone = document.getElementById("drop-zone");
+    const iconSubmit = document.getElementById("icon-submit");
+    const iconSpinner = document.getElementById("icon-spinner");
+
+    // Fetch live PyTorch & BitsAndBytes telemetry from backend
+    async function fetchModelStatus() {
+      try {
+        const res = await fetch("/api/model/status");
+        if (!res.ok) return;
+        const data = await res.json();
+        currentModelInfo = data;
+
+        const gpuStatusEl = document.getElementById("gpu-status");
+        const gpuDotEl = document.getElementById("gpu-dot");
+        const gpuDeviceBadge = document.getElementById("gpu-device-badge");
+        const vramStatEl = document.getElementById("vram-stat");
+
+        if (gpuStatusEl) {
+          gpuStatusEl.textContent = data.status_label || (data.is_ready ? `Model Ready (${data.quantization.split(" ")[0]})` : "Initializing...");
+          gpuStatusEl.title = `Model: ${data.base_model}\nQuantization: ${data.quantization}\nDevice: ${data.device}\nVRAM Allocated: ${data.vram_allocated_gb} GB\nVRAM Reserved: ${data.vram_reserved_gb} GB\nAdapter: ${data.adapter_path}`;
+        }
+        if (gpuDeviceBadge && data.device) {
+          gpuDeviceBadge.textContent = data.device.replace("NVIDIA GeForce ", "");
+          gpuDeviceBadge.title = `Device: ${data.device}\nVRAM: ${data.vram_allocated_gb} GB`;
+        }
+        if (vramStatEl && data.vram_allocated_gb > 0) {
+          vramStatEl.textContent = `VRAM: ${data.vram_allocated_gb} GB alloc / < 4.5 GB Cap`;
+        }
+        if (gpuDotEl) {
+          gpuDotEl.className = data.is_ready
+            ? "w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0"
+            : "w-2 h-2 rounded-full bg-amber-500 animate-ping shrink-0";
+        }
+      } catch (err) {
+        console.warn("Could not fetch model telemetry:", err);
+      }
+    }
+
+    // Initialize UI
+    async function init() {
+      lucide.createIcons();
+      await fetchModelStatus();
+      await loadSessions();
+      setupEventListeners();
+      // Periodically refresh VRAM and status telemetry
+      setInterval(fetchModelStatus, 15000);
+    }
+
+    async function loadSessions() {
+      try {
+        const res = await fetch("/api/sessions");
+        sessions = await res.json();
+        renderSessionsList();
+        if (sessions.length > 0 && !activeSession) {
+          selectSession(sessions[0].id);
+        } else if (sessions.length === 0) {
+          resetToNewJobState();
+        }
+      } catch (err) {
+        console.error("Failed to load sessions:", err);
+      }
+    }
+
+    function renderSessionsList() {
+      if (!sessions || sessions.length === 0) {
+        sessionsContainer.innerHTML = '<div class="text-xs text-zinc-500 text-center py-6">No saved job sessions.</div>';
+        return;
+      }
+
+      // Group by date
+      const today = new Date().toDateString();
+      const groups = { Today: [], "Previous 7 Days": [], Older: [] };
+
+      sessions.forEach(s => {
+        const d = new Date(s.updated_at || s.created_at);
+        const diffDays = Math.floor((Date.now() - d.getTime()) / (1000 * 3600 * 24));
+        if (d.toDateString() === today) {
+          groups["Today"].push(s);
+        } else if (diffDays <= 7) {
+          groups["Previous 7 Days"].push(s);
+        } else {
+          groups["Older"].push(s);
+        }
+      });
+
+      let html = "";
+      for (const [groupName, items] of Object.entries(groups)) {
+        if (items.length === 0) continue;
+        html += `<div class="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider px-2 pt-2">${groupName}</div>`;
+        items.forEach(s => {
+          const isActive = activeSession && activeSession.id === s.id;
+          const activeClass = isActive
+            ? "bg-zinc-800/90 text-white border-zinc-700/80 shadow-sm"
+            : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40 border-transparent";
+
+          html += `
+            <div class="group relative flex items-center justify-between p-2.5 rounded-lg border text-xs cursor-pointer transition ${activeClass}" onclick="selectSession('${s.id}')">
+              <div class="flex-1 min-w-0 pr-2">
+                <div class="font-medium truncate">${escapeHtml(s.title || "Untitled Role")}</div>
+                <div class="text-[10px] text-zinc-500 flex items-center gap-1.5 mt-0.5">
+                  <span>${s.evaluations_count || 0} candidates</span>
+                </div>
+              </div>
+              <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition shrink-0" onclick="event.stopPropagation()">
+                <button class="p-1 hover:text-red-400 text-zinc-500 transition" title="Delete Session" onclick="deleteSession('${s.id}')">
+                  <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                </button>
+              </div>
+            </div>
+          `;
+        });
+      }
+      sessionsContainer.innerHTML = html;
+      lucide.createIcons();
+    }
+
+    async function selectSession(sessionId) {
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`);
+        if (!res.ok) throw new Error("Session not found");
+        activeSession = await res.json();
+        renderActiveSession();
+        renderSessionsList();
+      } catch (err) {
+        console.error("Failed to select session:", err);
+      }
+    }
+
+    function renderActiveSession() {
+      if (!activeSession) return;
+
+      // Update header
+      headerJobTitle.textContent = activeSession.title;
+      headerCandCount.textContent = `${activeSession.evaluations.length} candidate${activeSession.evaluations.length === 1 ? '' : 's'}`;
+      headerCandCount.classList.remove("hidden");
+      document.getElementById("btn-export-csv").classList.remove("hidden");
+      document.getElementById("btn-export-json").classList.remove("hidden");
+
+      // Update anchored JD banner
+      const jdText = activeSession.compact_jd || activeSession.raw_jd;
+      jdTextPreview.textContent = jdText;
+      jdTextFull.textContent = activeSession.raw_jd;
+      anchoredJDBanner.classList.remove("hidden");
+
+      if (activeSession.compact_jd && activeSession.compact_jd !== activeSession.raw_jd) {
+        jdCompactBadge.classList.remove("hidden");
+      } else {
+        jdCompactBadge.classList.add("hidden");
+      }
+
+      // Hide empty state
+      emptyStateJD.classList.add("hidden");
+
+      // Render evaluation stream
+      evaluationsFeed.innerHTML = "";
+      if (activeSession.evaluations && activeSession.evaluations.length > 0) {
+        activeSession.evaluations.forEach((ev, idx) => {
+          renderEvaluationCard(ev, idx + 1);
+        });
+      }
+
+      // Enable input dock
+      inputResumeText.placeholder = `Paste candidate resume for ${activeSession.title}...`;
+      updateSubmitButtonState();
+      lucide.createIcons();
+      scrollToBottom();
+    }
+
+    function resetToNewJobState() {
+      activeSession = null;
+      headerJobTitle.textContent = "New Job Screening";
+      headerCandCount.classList.add("hidden");
+      document.getElementById("btn-export-csv").classList.add("hidden");
+      document.getElementById("btn-export-json").classList.add("hidden");
+      anchoredJDBanner.classList.add("hidden");
+      evaluationsFeed.innerHTML = "";
+      emptyStateJD.classList.remove("hidden");
+      inputJDText.value = "";
+      inputResumeText.placeholder = "Initialize a target Job Description above first...";
+      btnSubmitEval.disabled = true;
+      renderSessionsList();
+    }
+
+    function renderEvaluationCard(ev, candidateIdx) {
+      const card = document.createElement("div");
+      card.className = "bg-[#131418] border border-zinc-800/90 rounded-2xl p-6 shadow-xl space-y-5 transition animate-fadeIn";
+
+      const pj = ev.parsed_json || {};
+      const score = Number(ev.overall_score || pj.overall_score || 0);
+      const rec = ev.recommendation || pj.recommendation || "Reject";
+
+      // Color badge mappings
+      let badgeColor = "bg-red-500/10 text-red-400 border-red-500/20";
+      let ringColor = "#ef4444";
+      if (rec.toLowerCase().includes("strong hire")) {
+        badgeColor = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+        ringColor = "#10b981";
+      } else if (rec.toLowerCase().includes("hire")) {
+        badgeColor = "bg-green-500/10 text-green-400 border-green-500/20";
+        ringColor = "#22c55e";
+      } else if (rec.toLowerCase().includes("borderline")) {
+        badgeColor = "bg-amber-500/10 text-amber-400 border-amber-500/20";
+        ringColor = "#f59e0b";
+      }
+
+      // SVG Circle calculation (r=36, circumference = 2 * PI * 36 ~= 226)
+      const circumference = 226;
+      const strokeDashoffset = circumference - (score / 100) * circumference;
+
+      // Category progress bars
+      const cats = pj.category_scores || {};
+      const categoryBarsHtml = [
+        { label: "Technical Skills", val: cats.technical_skills ?? 0 },
+        { label: "Experience Relevance", val: cats.experience_relevance ?? 0 },
+        { label: "Education & Certifications", val: cats.education_and_certifications ?? 0 },
+        { label: "Leadership & Impact", val: cats.leadership_and_impact ?? 0 },
+      ].map(c => `
+        <div>
+          <div class="flex justify-between text-[11px] mb-1">
+            <span class="text-zinc-400">${c.label}</span>
+            <span class="font-mono text-zinc-300 font-medium">${c.val}/100</span>
+          </div>
+          <div class="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+            <div class="h-full bg-emerald-500 rounded-full transition-all duration-700" style="width: ${Math.min(100, Math.max(0, c.val))}%"></div>
+          </div>
+        </div>
+      `).join("");
+
+      // Skills chips
+      const strengths = pj.strengths || [];
+      const redFlags = pj.red_flags || [];
+      const missingSkills = pj.missing_skills || [];
+
+      const strengthsHtml = strengths.map(s => `
+        <li class="flex items-start gap-2 text-xs text-zinc-300">
+          <i data-lucide="check-circle-2" class="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5"></i>
+          <span>${escapeHtml(s)}</span>
+        </li>
+      `).join("");
+
+      const redFlagsHtml = redFlags.map(r => `
+        <li class="flex items-start gap-2 text-xs text-zinc-300">
+          <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5"></i>
+          <span>${escapeHtml(r)}</span>
+        </li>
+      `).join("");
+
+      const missingChipsHtml = missingSkills.map(m => `
+        <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+          ${escapeHtml(m)}
+        </span>
+      `).join("");
+
+      const evalTime = new Date(ev.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      card.innerHTML = `
+        <!-- Card Header -->
+        <div class="flex items-start justify-between pb-4 border-b border-zinc-800/80">
+          <div>
+            <div class="flex items-center gap-2">
+              <h4 class="text-base font-semibold text-zinc-100">${escapeHtml(ev.candidate_name || `Candidate #${candidateIdx}`)}</h4>
+              <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase tracking-wider border ${badgeColor}">
+                ${rec}
+              </span>
+            </div>
+            <p class="text-xs text-zinc-500 mt-0.5">Evaluated against ${escapeHtml(activeSession.title)} • ${evalTime}</p>
+          </div>
+          <button class="btn-copy-summary text-zinc-500 hover:text-zinc-300 p-1 transition" title="Copy Assessment">
+            <i data-lucide="copy" class="w-4 h-4"></i>
+          </button>
+        </div>
+
+        <!-- Score Meter & Category Bars -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
+          <!-- Circular Gauge -->
+          <div class="flex flex-col items-center justify-center p-3 bg-black/30 rounded-xl border border-zinc-800/60">
+            <div class="relative w-24 h-24 flex items-center justify-center">
+              <svg class="w-24 h-24 transform -rotate-90">
+                <circle cx="48" cy="48" r="36" stroke="#27272a" stroke-width="6" fill="transparent"/>
+                <circle cx="48" cy="48" r="36" stroke="${ringColor}" stroke-width="6" fill="transparent"
+                  stroke-dasharray="${circumference}" stroke-dashoffset="${strokeDashoffset}" stroke-linecap="round" class="score-circle"/>
+              </svg>
+              <div class="absolute flex flex-col items-center justify-center">
+                <span class="text-2xl font-bold font-mono text-zinc-100">${score}</span>
+                <span class="text-[10px] text-zinc-500 uppercase tracking-wider">Overall</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Category Progress Bars -->
+          <div class="md:col-span-2 space-y-2.5">
+            ${categoryBarsHtml}
+          </div>
+        </div>
+
+        <!-- Executive Summary -->
+        <div class="p-3.5 bg-black/40 rounded-xl border border-zinc-800/70 text-xs text-zinc-300 leading-relaxed font-sans">
+          <span class="font-semibold text-emerald-400 block mb-1">Executive Summary:</span>
+          ${escapeHtml(pj.summary || "No executive summary provided.")}
+        </div>
+
+        <!-- Strengths & Red Flags Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+          <div class="space-y-2">
+            <span class="text-xs font-semibold text-emerald-400 flex items-center gap-1.5">
+              <i data-lucide="check" class="w-3.5 h-3.5"></i> Verifiable Strengths
+            </span>
+            <ul class="space-y-1.5">${strengthsHtml || '<li class="text-xs text-zinc-500 italic">None noted.</li>'}</ul>
+          </div>
+          <div class="space-y-2">
+            <span class="text-xs font-semibold text-amber-400 flex items-center gap-1.5">
+              <i data-lucide="alert-circle" class="w-3.5 h-3.5"></i> Red Flags / Cautions
+            </span>
+            <ul class="space-y-1.5">${redFlagsHtml || '<li class="text-xs text-zinc-500 italic">None noted.</li>'}</ul>
+          </div>
+        </div>
+
+        <!-- Missing Skills Tags -->
+        ${missingSkills.length > 0 ? `
+          <div class="pt-2">
+            <span class="text-[11px] font-semibold text-zinc-400 block mb-1.5">Missing Required Competencies:</span>
+            <div class="flex flex-wrap gap-1.5">${missingChipsHtml}</div>
+          </div>
+        ` : ''}
+
+        <!-- Raw JSON Toggle -->
+        <div class="pt-2 border-t border-zinc-800/60 flex items-center justify-between">
+          <button class="btn-toggle-json text-xs text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition">
+            <span>View Raw JSON Response</span>
+            <i data-lucide="chevron-down" class="w-3 h-3"></i>
+          </button>
+          <span class="model-badge-card text-[10px] text-zinc-500 font-mono">${currentModelInfo ? (currentModelInfo.base_model.split('/')[1] + ' • ' + currentModelInfo.quantization.split(' ')[0]) : 'Qwen 2.5 3B • 8-bit INT8'}</span>
+        </div>
+        <pre class="json-payload hidden text-[11px] text-emerald-300 bg-black/60 p-3 rounded-lg border border-zinc-800 overflow-x-auto font-mono max-h-48">${escapeHtml(JSON.stringify(pj, null, 2))}</pre>
+      `;
+
+      // Wire up toggle inside card
+      const btnToggleJson = card.querySelector(".btn-toggle-json");
+      const jsonPayload = card.querySelector(".json-payload");
+      btnToggleJson.addEventListener("click", () => {
+        jsonPayload.classList.toggle("hidden");
+        btnToggleJson.querySelector("span").textContent = jsonPayload.classList.contains("hidden")
+          ? "View Raw JSON Response"
+          : "Hide Raw JSON Response";
+      });
+
+      evaluationsFeed.appendChild(card);
+    }
+
+    function setupEventListeners() {
+      // Toggle sidebar
+      document.getElementById("btn-toggle-sidebar").addEventListener("click", () => {
+        document.getElementById("sidebar").classList.toggle("-ml-80");
+      });
+
+      // New Job
+      document.getElementById("btn-new-session").addEventListener("click", resetToNewJobState);
+
+      // Expand/Collapse anchored JD
+      document.getElementById("btn-toggle-jd-expand").addEventListener("click", () => {
+        const full = jdTextFull;
+        const isHidden = full.classList.contains("hidden");
+        if (isHidden) {
+          full.classList.remove("hidden");
+          jdExpandLabel.textContent = "Collapse JD";
+          jdExpandIcon.setAttribute("data-lucide", "chevron-up");
+        } else {
+          full.classList.add("hidden");
+          jdExpandLabel.textContent = "Expand JD";
+          jdExpandIcon.setAttribute("data-lucide", "chevron-down");
+        }
+        lucide.createIcons();
+      });
+
+      // Submit JD
+      btnSubmitJD.addEventListener("click", async () => {
+        const text = inputJDText.value.trim();
+        if (!text) return;
+
+        btnSubmitJD.disabled = true;
+        btnSubmitJD.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Processing...`;
+        lucide.createIcons();
+
+        try {
+          const res = await fetch("/api/sessions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ raw_jd: text }),
+          });
+          const created = await res.json();
+          await loadSessions();
+          await selectSession(created.id);
+        } catch (err) {
+          alert("Error creating session: " + err.message);
+        } finally {
+          btnSubmitJD.disabled = false;
+          btnSubmitJD.innerHTML = `<i data-lucide="check" class="w-4 h-4"></i> Initialize Job Session`;
+          lucide.createIcons();
+        }
+      });
+
+      // Resume input change
+      inputResumeText.addEventListener("input", () => {
+        autoResizeTextarea(inputResumeText);
+        updateSubmitButtonState();
+      });
+
+      // File input change
+      fileInput.addEventListener("change", (e) => {
+        const file = e.target.files[0];
+        if (file) handleSelectedFile(file);
+      });
+
+      btnRemoveFile.addEventListener("click", () => {
+        pendingFile = null;
+        fileInput.value = "";
+        fileChip.classList.add("hidden");
+        updateSubmitButtonState();
+      });
+
+      // Drag and drop onto input dock
+      dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("border-emerald-500");
+      });
+      dropZone.addEventListener("dragleave", () => {
+        dropZone.classList.remove("border-emerald-500");
+      });
+      dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("border-emerald-500");
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          handleSelectedFile(e.dataTransfer.files[0]);
+        }
+      });
+
+      // Submit Candidate Evaluation
+      btnSubmitEval.addEventListener("click", submitCandidateEvaluation);
+
+      inputResumeText.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          if (!btnSubmitEval.disabled) submitCandidateEvaluation();
+        }
+      });
+
+      // Exports
+      document.getElementById("btn-export-csv").addEventListener("click", () => {
+        if (!activeSession) return;
+        window.open(`/api/sessions/${activeSession.id}/export/csv`, "_blank");
+      });
+      document.getElementById("btn-export-json").addEventListener("click", () => {
+        if (!activeSession) return;
+        window.open(`/api/sessions/${activeSession.id}/export/json`, "_blank");
+      });
+    }
+
+    function handleSelectedFile(file) {
+      pendingFile = file;
+      fileChipName.textContent = file.name;
+      fileChipSize.textContent = `(${(file.size / 1024).toFixed(1)} KB)`;
+      fileChip.classList.remove("hidden");
+      updateSubmitButtonState();
+    }
+
+    function updateSubmitButtonState() {
+      const hasText = inputResumeText.value.trim().length > 0;
+      const hasFile = pendingFile !== null;
+      btnSubmitEval.disabled = !(activeSession && (hasText || hasFile));
+    }
+
+    async function submitCandidateEvaluation() {
+      if (!activeSession) return;
+
+      const resumeText = inputResumeText.value.trim();
+      const file = pendingFile;
+
+      // Lock UI
+      btnSubmitEval.disabled = true;
+      iconSubmit.classList.add("hidden");
+      iconSpinner.classList.remove("hidden");
+
+      try {
+        let res;
+        if (file) {
+          const formData = new FormData();
+          formData.append("file", file);
+          if (resumeText) formData.append("extra_text", resumeText);
+          res = await fetch(`/api/sessions/${activeSession.id}/evaluate/file`, {
+            method: "POST",
+            body: formData,
+          });
+        } else {
+          res = await fetch(`/api/sessions/${activeSession.id}/evaluate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ resume_text: resumeText }),
+          });
+        }
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || "Evaluation failed");
+        }
+
+        const evaluation = await res.json();
+
+        // Add to active session and render
+        activeSession.evaluations.push(evaluation);
+        renderEvaluationCard(evaluation, activeSession.evaluations.length);
+        headerCandCount.textContent = `${activeSession.evaluations.length} candidate${activeSession.evaluations.length === 1 ? '' : 's'}`;
+
+        // Reset input dock
+        inputResumeText.value = "";
+        autoResizeTextarea(inputResumeText);
+        pendingFile = null;
+        fileInput.value = "";
+        fileChip.classList.add("hidden");
+        updateSubmitButtonState();
+        scrollToBottom();
+        lucide.createIcons();
+
+        // Refresh sidebar counts & model VRAM telemetry
+        loadSessions();
+        fetchModelStatus();
+      } catch (err) {
+        alert("Evaluation Error: " + err.message);
+      } finally {
+        iconSubmit.classList.remove("hidden");
+        iconSpinner.classList.add("hidden");
+        updateSubmitButtonState();
+      }
+    }
+
+    async function deleteSession(id) {
+      if (!confirm("Are you sure you want to delete this job session?")) return;
+      try {
+        await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+        if (activeSession && activeSession.id === id) {
+          activeSession = null;
+          await loadSessions();
+        } else {
+          await loadSessions();
+        }
+      } catch (err) {
+        alert("Failed to delete session: " + err.message);
+      }
+    }
+
+    function autoResizeTextarea(el) {
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 140) + "px";
+    }
+
+    function scrollToBottom() {
+      const stream = document.getElementById("chat-stream");
+      stream.scrollTop = stream.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      if (!str) return "";
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    window.addEventListener("DOMContentLoaded", init);
+  </script>
+</body>
+</html>
